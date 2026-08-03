@@ -1,0 +1,15 @@
+# Arduino build chiqishlari
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Maxfiy sozlamalar
+secrets.h
+*.local.h
+
+# Muharrir / OS
+.vscode/
+.DS_Store
+Thumbs.db
