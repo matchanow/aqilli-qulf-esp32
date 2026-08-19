@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% set nav = 'cards' %}
+{% block title %}Kartalar — Aqilli qulf{% endblock %}
+
+{% block content %}
+
+<div class="stats">
+  <div class="stat">
+    <span class="stat-label">Faol kartalar</span>
+    <span class="stat-value">{{ stats.cards_active }}<span class="stat-of">/{{ stats.cards_total }}</span></span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Bugun ochilgan</span>
+    <span class="stat-value">{{ stats.opens_today }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Bugun rad etilgan</span>
+    <span class="stat-value {{ 'warn' if stats.denied_today }}">{{ stats.denied_today }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Qurilmadan oxirgi xabar</span>
+    <span class="stat-value sm">{{ stats.last_seen | ago }}</span>
+  </div>
+</div>
+
+{% if unknown %}
+<section class="panel accent">
+  <h2>Tanilmagan kartalar</h2>
+  <p class="hint">
+    Bu kartalar qurilmaga tegizilgan, lekin ro&#39;yxatda yo&#39;q. Ismini yozib
+    <strong>Qo&#39;shish</strong> ni bosing — UID ni qo&#39;lda kiritish shart emas.
+  </p>
+  <ul class="unknown-list">
+    {% for u in unknown %}
+    <li>
+      <div class="unknown-head">
+        <code class="uid">{{ u.uid }}</code>
+        <span class="meta">{{ u.reader or "o'quvchi" }} &middot; {{ u.last_at | ago }} &middot; {{ u.tries }} marta</span>
+      </div>
+      <form method="post" action="/cards" class="row">
+        <input type="hidden" name="uid" value="{{ u.uid }}">
+        <input type="text" name="name" placeholder="Kimning kartasi?" required maxlength="60" autocomplete="off">
+        <button type="submit" class="btn primary">Qo&#39;shish</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>Yangi karta qo&#39;shish</h2>
+  <form method="post" action="/cards" class="row wrap">
+    <input type="text" name="uid" placeholder="UID — 8096039E" required maxlength="32"
+           autocomplete="off" spellcheck="false" class="mono">
+    <input type="text" name="name" placeholder="Ism" required maxlength="60" autocomplete="off">
+    <input type="text" name="note" placeholder="Izoh (ixtiyoriy)" maxlength="120" autocomplete="off">
+    <button type="submit" class="btn primary">Qo&#39;shish</button>
+  </form>
+  <p class="hint">
+    UID ni bo&#39;sh joy yoki ikki nuqta bilan yozsangiz ham bo&#39;ladi:
+    <code>80 96 03 9E</code>, <code>80:96:03:9E</code>.
+  </p>
+</section>
+
+<section class="panel">
+  <h2>Kartalar <span class="count">{{ cards | length }}</span></h2>
+
+  {% if not cards %}
+    <p class="empty">Hali birorta karta qo&#39;shilmagan.</p>
+  {% else %}
+  <div class="cards">
+    {% for c in cards %}
+    <article class="card {{ 'off' if not c.active }}">
+      <div class="card-main">
+        <div class="card-id">
+          <span class="card-name">{{ c.name }}</span>
+          <code class="uid">{{ c.uid }}</code>
+          {% if not c.active %}<span class="pill off">O&#39;chirilgan</span>{% endif %}
+        </div>
+        {% if c.note %}<p class="note">{{ c.note }}</p>{% endif %}
+        <dl class="card-times">
+          <div><dt>Qo&#39;shilgan</dt><dd>{{ c.created_at | fmt }}</dd></div>
+          <div><dt>Oxirgi ishlatilgan</dt><dd>{{ c.last_used | ago }}</dd></div>
+          <div><dt>Jami ochgan</dt><dd>{{ c.use_count }} marta</dd></div>
+        </dl>
+      </div>
+
+      <div class="card-actions">
+        <a class="btn ghost" href="/logs?uid={{ c.uid }}">Tarix</a>
+        <form method="post" action="/cards/{{ c.id }}/toggle">
+          <button type="submit" class="btn ghost">{{ "O'chirish" if c.active else "Yoqish" }}</button>
+        </form>
+        <details class="edit">
+          <summary class="btn ghost">Tahrir</summary>
+          <form method="post" action="/cards/{{ c.id }}/edit" class="row wrap">
+            <input type="text" name="name" value="{{ c.name }}" required maxlength="60">
+            <input type="text" name="note" value="{{ c.note }}" placeholder="Izoh" maxlength="120">
+            <button type="submit" class="btn primary">Saqlash</button>
+          </form>
+          <!-- Xabar data- atributida: ismda apostrof bo'lsa ham (masalan "Ma'ruf")
+               JS satrini buzmaydi. To'g'ridan-to'g'ri confirm('...') ichiga qo'ysak buzardi. -->
+          <form method="post" action="/cards/{{ c.id }}/delete"
+                data-msg="{{ c.name }} — kartani butunlay o'chirasizmi?"
+                onsubmit="return confirm(this.dataset.msg)">
+            <button type="submit" class="btn danger">Butunlay o&#39;chirish</button>
+          </form>
+        </details>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>So&#39;nggi harakat</h2>
+  {% if not recent %}
+    <p class="empty">Hali hodisa yo&#39;q. Qurilma ulanganda shu yerda ko&#39;rinadi.</p>
+  {% else %}
+  <ul class="feed">
+    {% for e in recent %}
+    <li class="feed-item {{ e.result }}">
+      <span class="feed-when">{{ e.at | fmt }}</span>
+      <span class="feed-what">{{ labels.get(e.result, e.result) }}</span>
+      <span class="feed-who">{{ e.name }}{% if e.uid %} <code class="uid sm">{{ e.uid }}</code>{% endif %}</span>
+      <span class="feed-where">{{ e.reader }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  <a class="more" href="/logs">Butun tarixni ko&#39;rish &rarr;</a>
+  {% endif %}
+</section>
+
+{% endblock %}

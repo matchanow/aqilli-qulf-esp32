@@ -209,25 +209,48 @@ O'chirish: /del <raqam>
 
 > Ro'yxatga eng ko'pi **40 ta** karta sig'adi (`MAX_CARDS`). Ism 16 belgigacha.
 
+## CRM — brauzerdan boshqarish
+
+Kartalarni Telegram o'rniga veb-paneldan boshqarish mumkin. Panel shu
+omborning [`server/`](server/) papkasida — FastAPI + SQLite, bitta konteyner.
+
+Nima beradi:
+
+- kartalarni qo'shish, o'chirish, vaqtincha to'xtatish
+- **tanilmagan kartalar** alohida ro'yxatda: qurilmaga tegizilgan karta o'zi
+  chiqadi, ismini yozib **Qo'shish** ni bosasiz — UID ni qo'lda kiritish shart emas
+- har bir karta uchun: qachon qo'shilgan, oxirgi marta qachon ishlatilgan, necha marta ochgan
+- to'liq tarix: kim, qachon, qaysi o'quvchida, ruxsat berildimi yoki rad etildimi
+
+O'rnatish va sozlash: [`server/README.md`](server/README.md).
+
 ## Serverdan yuklash
 
-Kartalarni o'z serveringizdan boshqarmoqchi bo'lsangiz, `gate_bot.ino` da
-manzilni ko'rsating:
+`gate_bot.ino` da manzillarni ko'rsating:
 
 ```cpp
-const char* CARDS_URL   = "https://sizning-server.uz/api/cards";
-const char* CARDS_TOKEN = "maxfiy-kalit";     // bo'sh bo'lsa yuborilmaydi
+const char* CARDS_URL   = "http://server-ip:8000/api/cards";
+const char* EVENTS_URL  = "http://server-ip:8000/api/events";
+const char* CARDS_TOKEN = "maxfiy-kalit";     // server .env dagi DEVICE_TOKEN
+const char* DEVICE_NAME = "eshik-1";          // bir nechta qulf bo'lsa ajratish uchun
 
 const unsigned long SYNC_INTERVAL_MS = 5UL * 60UL * 1000UL;   // 5 daqiqa, 0 = o'chirilgan
 ```
 
-ESP32 quyidagi holatlarda serverga murojaat qiladi:
+**Kartalar ro'yxati** quyidagi holatlarda tortiladi:
 
 - WiFi ga ulangan zahoti
 - har `SYNC_INTERVAL_MS` da bir marta
 - Telegramdan `/sync` yuborilganda
 
-`CARDS_TOKEN` bo'sh bo'lmasa, so'rovga `Authorization: Bearer <token>`
+**Hodisalar** (kim qachon kirgani) har 15 soniyada yuboriladi. WiFi uzilsa ular
+qurilma xotirasida 24 tagacha to'planib turadi va aloqa tiklanganda ketadi —
+shuning uchun internet yo'q paytdagi kirishlar ham tarixda qoladi.
+
+Vaqtni qurilma NTP dan oladi. Soat hali sozlanmagan bo'lsa (masalan ishga
+tushgan zahoti) `ts=0` yuboriladi va serverning o'zi qabul qilingan vaqtni qo'yadi.
+
+`CARDS_TOKEN` bo'sh bo'lmasa, so'rovlarga `Authorization: Bearer <token>`
 sarlavhasi qo'shiladi.
 
 ### Server nima qaytarishi kerak

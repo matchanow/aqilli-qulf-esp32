@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Kirish — Aqilli qulf{% endblock %}
+
+{% block content %}
+<div class="login">
+  <div class="login-mark">&#128274;</div>
+  <h1>Aqilli qulf</h1>
+  <p class="hint">Kartalarni boshqarish uchun kiring.</p>
+
+  <form method="post" action="/login" class="login-form">
+    <label>
+      <span>Login</span>
+      <input type="text" name="username" required autocomplete="username" autofocus>
+    </label>
+    <label>
+      <span>Parol</span>
+      <input type="password" name="password" required autocomplete="current-password">
+    </label>
+    <button type="submit" class="btn primary full">Kirish</button>
+  </form>
+</div>
+{% endblock %}

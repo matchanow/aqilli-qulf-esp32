@@ -8,6 +8,13 @@ build/
 # Maxfiy sozlamalar
 secrets.h
 *.local.h
+.env
+
+# Server
+__pycache__/
+*.pyc
+.venv/
+server/data/
 
 # Muharrir / OS
 .vscode/

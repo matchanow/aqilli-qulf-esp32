@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% set nav = 'logs' %}
+{% block title %}Tarix — Aqilli qulf{% endblock %}
+
+{% block content %}
+
+<section class="panel">
+  <h2>Tarix</h2>
+
+  <form method="get" action="/logs" class="row wrap filters">
+    <input type="text" name="uid" value="{{ f_uid }}" placeholder="UID bo&#39;yicha"
+           maxlength="32" class="mono" autocomplete="off">
+    <select name="result">
+      <option value="">Hammasi</option>
+      {% for key, label in labels.items() %}
+        <option value="{{ key }}" {{ 'selected' if f_result == key }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn primary">Filtrlash</button>
+    {% if f_uid or f_result %}<a class="btn ghost" href="/logs">Tozalash</a>{% endif %}
+  </form>
+
+  {% if not events %}
+    <p class="empty">Bu shartlarga mos yozuv topilmadi.</p>
+  {% else %}
+  <p class="hint">{{ events | length }} ta yozuv, eng yangisi tepada.</p>
+  <div class="tablewrap">
+    <table class="log">
+      <thead>
+        <tr><th>Vaqt</th><th>Hodisa</th><th>Karta</th><th>UID</th><th>O&#39;quvchi</th></tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+        <tr class="{{ e.result }}">
+          <td data-label="Vaqt" class="mono nowrap">{{ e.at | fmt }}</td>
+          <td data-label="Hodisa"><span class="pill {{ e.result }}">{{ labels.get(e.result, e.result) }}</span></td>
+          <td data-label="Karta">{{ e.name }}</td>
+          {# UID siz hodisalarda (masalan "plata ishga tushdi") havola chizmaymiz -
+             bo'sh havola ostiga chizilgan chiziqcha bo'lib ko'rinardi. #}
+          <td data-label="UID">
+            {%- if e.uid %}<a class="mono" href="/logs?uid={{ e.uid }}">{{ e.uid }}</a>{% endif -%}
+          </td>
+          <td data-label="O&#39;quvchi">{{ e.reader }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+{% endblock %}

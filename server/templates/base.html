@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Aqilli qulf{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%F0%9F%94%90</text></svg>">
+</head>
+<body>
+
+{% if user %}
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">
+      <span class="brand-mark">&#128274;</span>
+      <span>Aqilli qulf</span>
+    </a>
+    <nav>
+      <a href="/" class="{{ 'on' if nav == 'cards' }}">Kartalar</a>
+      <a href="/logs" class="{{ 'on' if nav == 'logs' }}">Tarix</a>
+      <form method="post" action="/logout"><button type="submit" class="linkbtn">Chiqish</button></form>
+    </nav>
+  </div>
+</header>
+{% endif %}
+
+<main class="page">
+  {% if flash %}
+    <div class="flash {{ flash.kind }}">{{ flash.message }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+
+</body>
+</html>

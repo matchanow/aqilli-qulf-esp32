@@ -52,6 +52,7 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <esp_system.h>
+#include <time.h>
 
 // ================= SOZLAMALAR =================
 // WiFi paroli kodda saqlanmaydi - foydalanuvchi telefondan kiritadi.
@@ -71,6 +72,12 @@ String ALLOWED_CHAT_ID = "";
 //   [{"uid":"8096039E","name":"Aziz"}]
 const char* CARDS_URL   = "";                 // masalan "https://sizning-server.uz/api/cards"
 const char* CARDS_TOKEN = "";                 // bo'sh bo'lmasa Authorization: Bearer ... yuboriladi
+
+// Hodisalar CRM ga shu manzilga yuboriladi - "qaysi karta qachon ishlatilgani"
+// shu yerdan yoziladi. Bo'sh bo'lsa hodisa yuborilmaydi.
+// CARDS_TOKEN o'sha token sifatida ishlatiladi.
+const char* EVENTS_URL  = "";                 // masalan "https://sizning-server.uz/api/events"
+const char* DEVICE_NAME = "eshik-1";          // bir nechta qulf bo'lsa ajratish uchun
 
 // Avtomatik sinxronlash. 0 = faqat qo'lda (/sync).
 const unsigned long SYNC_INTERVAL_MS = 5UL * 60UL * 1000UL;   // 5 daqiqa
@@ -140,6 +147,27 @@ char learnName[NAME_LEN] = "";
 // yadro 0 yozadi, yadro 1 o'qiydi.
 volatile bool lastUnknownValid = false;
 byte lastUnknownUid[4];
+
+// ================= Hodisalar navbati =================
+// Yadro 0 hodisani navbatga qo'yadi, yadro 1 uni serverga yuboradi.
+// Bu yerda ham String ishlatmaymiz - yadrolar aro uzatilgan String heap ni buzadi.
+// WiFi yo'q bo'lsa hodisalar to'planib turadi va tarmoq tiklanganda ketadi,
+// shuning uchun ulanish uzilgan paytdagi kirishlar ham yo'qolmaydi.
+struct Ev {
+  byte     uid[4];
+  bool     hasUid;
+  char     reader[8];
+  char     result[10];
+  uint32_t ts;            // UTC epoch; 0 = qurilma soati sozlanmagan
+};
+
+const int EV_QUEUE = 24;
+Ev  evQueue[EV_QUEUE];
+volatile int evHead = 0, evTail = 0;
+SemaphoreHandle_t evMutex;
+unsigned long lastFlush = 0;
+const unsigned long FLUSH_MS = 15000;   // navbatni shuncha vaqtda bir bo'shatamiz
+bool timeReady = false;
 
 // ================= PWM =================
 const int PWM_CH = 0, PWM_FREQ = 1000, PWM_RES = 8;
@@ -516,6 +544,94 @@ bool syncFromServer(String &report) {
   return true;
 }
 
+// ================= Hodisalarni serverga yuborish =================
+
+// Qurilma soati. NTP dan oldin 1970-yilni qaytaradi - bunday vaqtni yuborsak
+// CRM da tarix buzilardi, shuning uchun 0 yuboramiz va serverning o'zi
+// qabul qilingan vaqtni qo'yadi.
+uint32_t nowEpoch() {
+  if (!timeReady) return 0;
+  time_t t = time(nullptr);
+  return (t < 1577836800) ? 0 : (uint32_t) t;
+}
+
+// Yadro 0 dan ham, yadro 1 dan ham chaqirilishi mumkin.
+void pushEvent(const byte *uid, const char *reader, const char *result) {
+  if (!strlen(EVENTS_URL)) return;
+  xSemaphoreTake(evMutex, portMAX_DELAY);
+  int next = (evHead + 1) % EV_QUEUE;
+  if (next != evTail) {                 // navbat to'lgan bo'lsa yangisini tashlaymiz
+    Ev &e = evQueue[evHead];
+    e.hasUid = (uid != nullptr);
+    if (uid) memcpy(e.uid, uid, 4); else memset(e.uid, 0, 4);
+    strlcpy(e.reader, reader ? reader : "", sizeof(e.reader));
+    strlcpy(e.result, result, sizeof(e.result));
+    e.ts = nowEpoch();
+    evHead = next;
+  }
+  xSemaphoreGive(evMutex);
+}
+
+// Yadro 1 dan chaqiriladi. Navbatni bir POST da yuboradi.
+// Yozuvlar faqat server 2xx qaytargandan KEYIN o'chiriladi - aks holda
+// tarmoq uzilganda hodisalar yo'qolib ketardi.
+void flushEvents() {
+  if (!strlen(EVENTS_URL)) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  xSemaphoreTake(evMutex, portMAX_DELAY);
+  int head = evHead, tail = evTail;
+  xSemaphoreGive(evMutex);
+  if (head == tail) return;
+
+  String body = "{\"device\":\"" + String(DEVICE_NAME) + "\",\"events\":[";
+  int sent = 0;
+  for (int i = tail; i != head; i = (i + 1) % EV_QUEUE) {
+    Ev &e = evQueue[i];
+    if (sent) body += ",";
+    body += "{\"uid\":\"";
+    if (e.hasUid) body += uidToHex(e.uid);
+    body += "\",\"reader\":\"" + String(e.reader) +
+            "\",\"result\":\"" + String(e.result) +
+            "\",\"ts\":" + String(e.ts) + "}";
+    sent++;
+  }
+  body += "]}";
+
+  HTTPClient http;
+  WiFiClientSecure *sec = nullptr;
+  bool started;
+  if (String(EVENTS_URL).startsWith("https://")) {
+    sec = new WiFiClientSecure;
+    if (!sec) return;
+    sec->setInsecure();
+    started = http.begin(*sec, EVENTS_URL);
+  } else {
+    started = http.begin(EVENTS_URL);
+  }
+  if (!started) {
+    if (sec) delete sec;
+    return;
+  }
+
+  http.setTimeout(10000);
+  http.addHeader("Content-Type", "application/json");
+  if (strlen(CARDS_TOKEN)) http.addHeader("Authorization", String("Bearer ") + CARDS_TOKEN);
+
+  int code = http.POST(body);
+  http.end();
+  if (sec) delete sec;
+
+  if (code >= 200 && code < 300) {
+    xSemaphoreTake(evMutex, portMAX_DELAY);
+    evTail = head;                      // faqat yuborilganini o'chiramiz;
+    xSemaphoreGive(evMutex);            // shu orada qo'shilgani navbatda qoladi
+    Serial.printf("Hodisalar yuborildi: %d ta\n", sent);
+  } else {
+    Serial.printf("Hodisa yuborilmadi (kod %d), navbatda qoldi: %d ta\n", code, sent);
+  }
+}
+
 // ================= Karta =================
 // HALT holatidagi kartani REQA ko'rmaydi, WUPA esa ko'radi
 bool cardPresent(MFRC522 &dev) {
@@ -567,8 +683,10 @@ void serviceReader(ReaderState &r) {
       int res = addCard(uid, learnName);
       learnMode = false;
       Serial.printf("[%s] O'QITISH: %s -> %d\n", r.name, hex.c_str(), res);
-      if (res == 1)
+      if (res == 1) {
+        pushEvent(uid, r.name, "learn");
         queueNotify("\xE2\x9C\x85 Yangi karta qo'shildi: " + hex + "  (" + String(learnName) + ")");
+      }
       else if (res == 0)
         queueNotify("\xE2\x84\xB9 Bu karta allaqachon ro'yxatda: " + hex);
       else
@@ -583,12 +701,14 @@ void serviceReader(ReaderState &r) {
                 ok ? "RUXSAT" : "RAD ETILDI");
 
   if (ok) {
+    pushEvent(uid, r.name, "allowed");
     if (doOpen(r.name))
       queueNotify("\xF0\x9F\x93\xB3 " + String(r.name) + " o'quvchi - karta bilan ochildi: " + hex);
   } else {
     if (sized4) {
       memcpy(lastUnknownUid, uid, 4);
       lastUnknownValid = true;
+      pushEvent(uid, r.name, "denied");   // CRM da "tanilmagan kartalar" shu yerdan chiqadi
     }
     queueNotify("\xE2\x9B\x94 " + String(r.name) + " o'quvchi - notanish karta: " + hex +
                 "\n\nQo'shish uchun: /addlast <ism>");
@@ -630,11 +750,15 @@ void handleMessages(int count) {
     }
 
     if (cmd == "/open") {
-      String m = doOpen("TELEGRAM") ? "\xF0\x9F\x94\x93 Ochildi\n\n" : "Eshik allaqachon ochiq\n\n";
+      bool did = doOpen("TELEGRAM");
+      if (did) pushEvent(nullptr, "TELEGRAM", "open");
+      String m = did ? "\xF0\x9F\x94\x93 Ochildi\n\n" : "Eshik allaqachon ochiq\n\n";
       bot.sendMessageWithInlineKeyboard(chat_id, m + statusText(), "", KEYBOARD);
     }
     else if (cmd == "/close") {
-      String m = doClose("TELEGRAM") ? "\xF0\x9F\x94\x92 Yopildi\n\n" : "Eshik allaqachon yopiq\n\n";
+      bool did = doClose("TELEGRAM");
+      if (did) pushEvent(nullptr, "TELEGRAM", "close");
+      String m = did ? "\xF0\x9F\x94\x92 Yopildi\n\n" : "Eshik allaqachon yopiq\n\n";
       bot.sendMessageWithInlineKeyboard(chat_id, m + statusText(), "", KEYBOARD);
     }
     // ---- Kartalar ----
@@ -767,6 +891,12 @@ void setup() {
   gateMutex   = xSemaphoreCreateMutex();
   notifyMutex = xSemaphoreCreateMutex();
   cardsMutex  = xSemaphoreCreateMutex();
+  evMutex     = xSemaphoreCreateMutex();
+
+  // Ishga tushish hodisasi. Soat hali sozlanmagan - ts=0 ketadi va serverning
+  // o'zi qabul qilingan vaqtni qo'yadi. Qayta yuklanishlarni kuzatish uchun kerak:
+  // tez-tez takrorlansa, bu odatda kuchlanish cho'kishidan darak beradi.
+  pushEvent(nullptr, "", "boot");
 
   // Kartalarni RFID vazifasidan OLDIN yuklaymiz, aks holda birinchi soniyalarda
   // ro'yxat bo'sh bo'lib, haqiqiy karta rad etilardi.
@@ -827,12 +957,22 @@ void loop() {
     Serial.println("WiFi: " + WiFi.SSID() + "   IP: " + WiFi.localIP().toString());
     Serial.println("Bot tayyor. Telegramda /start yuboring.");
 
+    // Soatni NTP dan olamiz - hodisalarga to'g'ri vaqt qo'yish uchun.
+    // UTC da yuritamiz; mahalliy vaqtga o'girishni CRM bajaradi.
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+
     // Ulanishi bilan ro'yxatni serverdan olamiz
     if (strlen(CARDS_URL)) {
       String report;
       syncFromServer(report);
       lastSync = millis();
     }
+  }
+
+  // NTP javob berdimi? Shundan keyin hodisalarga haqiqiy vaqt qo'yiladi.
+  if (!timeReady && WiFi.status() == WL_CONNECTED && time(nullptr) > 1577836800) {
+    timeReady = true;
+    Serial.println("Soat NTP dan olindi.");
   }
   if (botReady && WiFi.status() != WL_CONNECTED) {
     botReady = false;
@@ -855,7 +995,17 @@ void loop() {
 
   // Avtomatik yopilish
   if (gateOpen && millis() - openedAt >= AUTO_CLOSE_MS) {
-    if (doClose("AVTO")) queueNotify("\xF0\x9F\x94\x92 Vaqt tugadi - avtomatik yopildi");
+    if (doClose("AVTO")) {
+      pushEvent(nullptr, "AVTO", "close");
+      queueNotify("\xF0\x9F\x94\x92 Vaqt tugadi - avtomatik yopildi");
+    }
+  }
+
+  // Hodisalarni serverga yuborish. Telegram dan mustaqil - bot sozlanmagan
+  // bo'lsa ham CRM tarixi to'lib boradi.
+  if (strlen(EVENTS_URL) && millis() - lastFlush > FLUSH_MS) {
+    flushEvents();
+    lastFlush = millis();
   }
 
   if (botReady) {
