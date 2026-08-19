@@ -2,6 +2,10 @@
 
 RFID karta va Telegram bot orqali boshqariladigan eshik/qulf tizimi.
 
+**Ikkita RC522 o'quvchi** ishlatiladi — biri tashqarida (eshik oldida), biri
+ichkarida. Ikkalasi ham bir xil ro'yxatdagi kartalarni qabul qiladi va eshikni
+ochadi; Telegramga kelgan xabarda qaysi o'quvchi ishlagani ko'rsatiladi.
+
 Karta tegizilganda eshik ochiladi va belgilangan vaqtdan keyin o'zi yopiladi.
 Shu bilan birga Telegram botdagi tugmalar orqali istalgan paytda ochish, yopish
 va holatni ko'rish mumkin.
@@ -9,6 +13,7 @@ va holatni ko'rish mumkin.
 ## Imkoniyatlari
 
 - **RFID karta bilan ochish** — faqat ro'yxatdagi kartalar ishlaydi
+- **Ikkita o'quvchi** — tashqi va ichki, bitta SPI shinasida, bir-birini bloklamaydi
 - **Telegram boshqaruvi** — `Ochish` / `Yopish` / `Holat` tugmalari
 - **Avtomatik yopilish** — belgilangan vaqtdan keyin
 - **Holat ko'rsatkichi** — ochiqmi yopiqmi, necha soniya qolgani
@@ -20,25 +25,39 @@ va holatni ko'rish mumkin.
 | Qism | Izoh |
 |---|---|
 | ESP32 DevKit | ESP32-WROOM-32 asosidagi |
-| RC522 (MFRC522) | RFID o'quvchi, **3.3V** |
+| RC522 (MFRC522) × **2** | RFID o'quvchi, **3.3V** |
 | L298N | motor drayveri |
 | DC motor | 5–6V kichik motor |
 | Manba | motor uchun alohida, 5–7.5V |
 
 ## Ulash
 
-### RC522 → ESP32
+### RC522 × 2 → ESP32
 
-| RC522 | ESP32 |
-|---|---|
-| SDA / SS | GPIO 5 |
-| SCK | GPIO 18 |
-| MOSI | GPIO 23 |
-| MISO | GPIO 19 |
-| RST | GPIO 22 |
-| IRQ | ulanmaydi |
-| VCC | **3.3V** |
-| GND | GND |
+Ikkala modul bitta SPI shinasini bo'lishadi — `SCK`, `MOSI`, `MISO` **umumiy**,
+ya'ni har ikkala modulning shu uchta pini ESP32 ning bir xil oyoqchasiga boradi.
+Farqi faqat `SS` va `RST` da: shu ikki chiziq orqali ESP32 qaysi modul bilan
+gaplashayotganini tanlaydi.
+
+| RC522 pini | #1 — TASHQI | #2 — ICHKI |
+|---|---|---|
+| SDA / SS | GPIO **5** | GPIO **21** |
+| RST | GPIO **22** | GPIO **4** |
+| SCK | GPIO 18 | GPIO 18 *(umumiy)* |
+| MOSI | GPIO 23 | GPIO 23 *(umumiy)* |
+| MISO | GPIO 19 | GPIO 19 *(umumiy)* |
+| IRQ | ulanmaydi | ulanmaydi |
+| VCC | **3.3V** | **3.3V** |
+| GND | GND | GND |
+
+> **Modullarni bir-biridan kamida 10–15 sm uzoqroq joylashtiring.** Ikkalasi
+> 13.56 MHz da ishlaydi — yaqin tursa antennalari bir-biriga xalaqit beradi va
+> karta goho o'qilmay qoladi. Eshikning ikki tomoniga o'rnatilsa bu muammo
+> o'z-o'zidan hal bo'ladi.
+
+> **Nega aynan GPIO 21 va 4?** Ikkalasi ham bo'sh, strapping pin emas va chiqish
+> sifatida xavfsiz. GPIO 12 va 15 dan qoching — ular ESP32 ning boot rejimiga
+> ta'sir qiladi va plata umuman ishga tushmay qolishi mumkin.
 
 ### L298N → ESP32
 
@@ -51,15 +70,18 @@ va holatni ko'rish mumkin.
 | GND | GND (umumiy) |
 
 ```
-                    ESP32
-                 ┌─────────┐
-   RC522 SS  ────┤ 5    27 ├──── IN1  L298N
-   RC522 SCK ────┤ 18   26 ├──── IN2
-   RC522 MOSI────┤ 23   14 ├──── ENA
-   RC522 MISO────┤ 19      │
-   RC522 RST ────┤ 22  3V3 ├──── RC522 VCC
-                 │     GND ├──── umumiy GND
-                 └─────────┘
+                              ESP32
+                           ┌─────────┐
+      #1 TASHQI  SS   ─────┤  5   27 ├───── IN1   L298N
+      #2 ICHKI   SS   ─────┤ 21   26 ├───── IN2
+      #1 TASHQI  RST  ─────┤ 22   14 ├───── ENA
+      #2 ICHKI   RST  ─────┤  4      │
+                           │         │
+      ikkalasi   SCK  ─────┤ 18      │
+      ikkalasi   MOSI ─────┤ 23      │
+      ikkalasi   MISO ─────┤ 19  3V3 ├───── ikkala RC522 VCC
+                           │     GND ├───── umumiy GND
+                           └─────────┘
 ```
 
 ### Jumperlar — diqqat
@@ -183,6 +205,30 @@ Arduino Uno bilan bu xato tez-tez chiqadi — Uno 5V mantiqda ishlaydi va uning
 
 Kutubxona faqat `0x91`, `0x92`, `0x88` ni taniydi. Boshqa qiymat klon chipni
 bildiradi va odatda **muammo emas** — karta o'qilayotgan bo'lsa, e'tibor bermang.
+
+**Faqat bitta o'quvchi ishlayapti**
+
+Plata ishga tushganda Serial Monitor (115200) da har ikkala modul tekshiriladi:
+
+```
+O'quvchi TASHQI VersionReg = 0x92  ok
+O'quvchi ICHKI  VersionReg = 0x00  <-- JAVOB YO'Q! ulanishni tekshiring
+```
+
+`0x00` yoki `0xFF` — modul umuman javob bermayapti. Tekshiring:
+
+1. `SS` va `RST` **har bir modulda alohida** pinga ulanganmi (5/22 va 21/4)
+2. `SCK`, `MOSI`, `MISO` ikkala modulda **bir xil** pinga ulanganmi
+3. Ikkala modulga ham 3.3V va GND borganmi
+
+**Kartalar goho o'qilmay qoladi**
+
+Modullar bir-biriga juda yaqin — antennalari xalaqit beryapti. 10–15 sm
+uzoqlashtiring yoki eshikning ikki tomoniga o'rnating.
+
+Agar uzoqlashtirish imkoni bo'lmasa, arzon RC522 modullarining MISO chizig'i
+tanlanmagan holatda ham to'liq "qo'yib yubormasligi" sabab bo'lishi mumkin —
+bu holda MISO ga 3-holatli bufer (masalan 74HC125) qo'yish kerak bo'ladi.
 
 **Motor kuchsiz aylanadi**
 

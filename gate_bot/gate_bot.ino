@@ -1,8 +1,8 @@
 /*
-  ESP32 + RC522 + L298N + Telegram bot
-  ------------------------------------
+  ESP32 + 2x RC522 + L298N + Telegram bot
+  ---------------------------------------
   Ikki yadroli ishlash:
-    Yadro 0 -> RFID + motor   (WiFi dan mustaqil, hech qachon to'xtamaydi)
+    Yadro 0 -> RFID (2 ta o'quvchi) + motor   (WiFi dan mustaqil, hech qachon to'xtamaydi)
     Yadro 1 -> WiFi + Telegram + avtomatik yopilish
 
   Shu sababli karta HAR DOIM ishlaydi:
@@ -14,13 +14,20 @@
 
   Ulash
   -----
-  RC522:                 L298N:
-    SDA/SS -> GPIO 5       IN1 -> GPIO 27
-    SCK    -> GPIO 18      IN2 -> GPIO 26
-    MOSI   -> GPIO 23      ENA -> GPIO 14  (jumper OLINGAN bo'lsin!)
-    MISO   -> GPIO 19      OUT1/OUT2 -> motor
-    RST    -> GPIO 22      GND -> ESP32 GND bilan UMUMIY
-    VCC    -> 3.3V
+  Ikkala RC522 bitta SPI shinasini BO'LISHADI (SCK/MOSI/MISO umumiy).
+  Farqi faqat SS va RST pinlarida.
+
+  RC522 #1 (TASHQI):     RC522 #2 (ICHKI):      L298N:
+    SDA/SS -> GPIO 5       SDA/SS -> GPIO 21      IN1 -> GPIO 27
+    RST    -> GPIO 22      RST    -> GPIO 4       IN2 -> GPIO 26
+    SCK    -> GPIO 18      SCK    -> GPIO 18      ENA -> GPIO 14  (jumper OLINGAN bo'lsin!)
+    MOSI   -> GPIO 23      MOSI   -> GPIO 23      OUT1/OUT2 -> motor
+    MISO   -> GPIO 19      MISO   -> GPIO 19      GND -> ESP32 GND bilan UMUMIY
+    VCC    -> 3.3V         VCC    -> 3.3V
+
+  DIQQAT: ikkita RC522 ni bir-biridan kamida 10-15 sm uzoqroq joylashtiring.
+  Ikkalasi 13.56 MHz da ishlaydi - yaqin tursa antennalari bir-biriga xalaqit
+  beradi va karta goho o'qilmay qoladi.
 */
 
 #include <WiFi.h>
@@ -45,11 +52,20 @@ String ALLOWED_CHAT_ID = "";
 #define BOOT_BTN 0        // BOOT tugmasi - sozlashni majburan ochish uchun
 
 // ================= Pinlar =================
-#define SS_PIN   5
-#define RST_PIN  22
+// SPI shinasi - ikkala o'quvchi uchun umumiy
 #define SPI_SCK  18
 #define SPI_MISO 19
 #define SPI_MOSI 23
+
+// O'quvchi #1 - tashqarida (eshik oldida)
+#define SS1_PIN   5
+#define RST1_PIN  22
+
+// O'quvchi #2 - ichkarida
+// GPIO 21 va 4 tanlandi: ikkalasi ham bo'sh, strapping pin emas va chiqish
+// sifatida xavfsiz. (GPIO 12 va 15 dan qoching - ular boot rejimiga ta'sir qiladi.)
+#define SS2_PIN   21
+#define RST2_PIN  4
 
 const int IN1 = 27;
 const int IN2 = 26;
@@ -63,8 +79,12 @@ const unsigned long CLOSE_MS      = 700;    // yopish uchun aylanish
 const unsigned long AUTO_CLOSE_MS = 10000;  // ochiq turish vaqti
 
 const int REMOVAL_CHECKS = 5;
+const int RFID_LOOP_MS   = 50;              // o'quvchilar necha ms da bir tekshiriladi
 
 // ================= Ruxsat berilgan kartalar =================
+// Ro'yxat ikkala o'quvchi uchun umumiy.
+// Ichki/tashqi uchun alohida ro'yxat kerak bo'lsa - shu yerda ikkita massiv
+// qilib, isAllowed() ga o'quvchi indeksini uzating.
 const byte ALLOWED[][4] = {
   { 0x80, 0x96, 0x03, 0x9E },
 };
@@ -74,19 +94,44 @@ const int ALLOWED_COUNT = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
 const int PWM_CH = 0, PWM_FREQ = 1000, PWM_RES = 8;
 
 // ================= Global =================
-MFRC522 rfid(SS_PIN, RST_PIN);
+MFRC522 rfid1(SS1_PIN, RST1_PIN);
+MFRC522 rfid2(SS2_PIN, RST2_PIN);
+
+// Har bir o'quvchi o'z holatini yuritadi.
+// "waiting" - karta o'qildi, endi u olinishini kutyapmiz.
+// Bu kutish BLOKLAMAYDI: aks holda bitta o'quvchida unutib qoldirilgan karta
+// ikkinchisini butunlay o'lik qilib qo'yardi.
+struct ReaderState {
+  MFRC522*    dev;
+  const char* name;
+  int         absent;
+  bool        waiting;
+};
+
+ReaderState readers[] = {
+  { &rfid1, "TASHQI", 0, false },
+  { &rfid2, "ICHKI",  0, false },
+};
+const int READER_COUNT = sizeof(readers) / sizeof(readers[0]);
+
 WiFiClientSecure secured;
 UniversalTelegramBot bot(BOT_TOKEN, secured);
 WiFiManager wm;
 
 SemaphoreHandle_t gateMutex;      // motorni bir vaqtda faqat bitta yadro boshqarsin
+SemaphoreHandle_t notifyMutex;    // xabar navbatini himoya qiladi
 
 volatile bool gateOpen = false;
 volatile unsigned long openedAt = 0;
 
-String  notifyChat  = "";         // karta hodisalari shu chatga yuboriladi
-String  pendingMsg  = "";         // yadro 0 yozadi, yadro 1 yuboradi
-volatile bool pendingNotify = false;
+String notifyChat = "";           // karta hodisalari shu chatga yuboriladi
+
+// Xabar navbati (halqa bufer).
+// Ilgari bitta String edi - endi ikkita o'quvchi bor, ikki hodisa bir vaqtda
+// kelsa bittasi yo'qolib ketardi.
+const int NOTIFY_QUEUE_SIZE = 8;
+String notifyQueue[NOTIFY_QUEUE_SIZE];
+volatile int notifyHead = 0, notifyTail = 0;
 
 bool botReady = false;
 const unsigned long POLL_MS = 1500;
@@ -190,8 +235,35 @@ String statusText() {
 // Yadro 0 dan Telegramga to'g'ridan-to'g'ri yozib bo'lmaydi (tarmoq yadro 1 da).
 // Shuning uchun xabarni navbatga qo'yamiz.
 void queueNotify(const String &msg) {
-  pendingMsg    = msg;
-  pendingNotify = true;
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  int next = (notifyHead + 1) % NOTIFY_QUEUE_SIZE;
+  if (next != notifyTail) {            // navbat to'lgan bo'lsa - yangisini tashlab yuboramiz
+    notifyQueue[notifyHead] = msg;
+    notifyHead = next;
+  }
+  xSemaphoreGive(notifyMutex);
+}
+
+bool popNotify(String &out) {
+  bool got = false;
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  if (notifyTail != notifyHead) {
+    out = notifyQueue[notifyTail];
+    notifyQueue[notifyTail] = "";      // String xotirasini bo'shatamiz
+    notifyTail = (notifyTail + 1) % NOTIFY_QUEUE_SIZE;
+    got = true;
+  }
+  xSemaphoreGive(notifyMutex);
+  return got;
+}
+
+void clearNotifyQueue() {
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  while (notifyTail != notifyHead) {
+    notifyQueue[notifyTail] = "";
+    notifyTail = (notifyTail + 1) % NOTIFY_QUEUE_SIZE;
+  }
+  xSemaphoreGive(notifyMutex);
 }
 
 // ================= Karta =================
@@ -218,50 +290,58 @@ String uidToString(MFRC522::Uid &uid) {
 }
 
 // HALT holatidagi kartani REQA ko'rmaydi, WUPA esa ko'radi
-bool cardPresent() {
+bool cardPresent(MFRC522 &dev) {
   byte atqa[2];
   byte len = sizeof(atqa);
-  MFRC522::StatusCode s = rfid.PICC_WakeupA(atqa, &len);
+  MFRC522::StatusCode s = dev.PICC_WakeupA(atqa, &len);
   if (s == MFRC522::STATUS_OK || s == MFRC522::STATUS_COLLISION) {
-    rfid.PICC_HaltA();
+    dev.PICC_HaltA();
     return true;
   }
   return false;
 }
 
-void checkCard() {
-  if (!rfid.PICC_IsNewCardPresent()) return;
-  if (!rfid.PICC_ReadCardSerial())   return;
+// Bitta o'quvchini bir marta "xizmat qiladi". Hech qachon uzoq bloklamaydi -
+// shuning uchun ikkala o'quvchi navbatma-navbat, bir-biriga xalaqit bermay ishlaydi.
+void serviceReader(ReaderState &r) {
+  // Karta olinishini kutish bosqichi
+  if (r.waiting) {
+    r.absent = cardPresent(*r.dev) ? 0 : r.absent + 1;
+    if (r.absent >= REMOVAL_CHECKS) {
+      r.waiting = false;
+      r.absent  = 0;
+    }
+    return;
+  }
 
-  String uid = uidToString(rfid.uid);
-  bool ok = isAllowed(rfid.uid);
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
+  if (!r.dev->PICC_IsNewCardPresent()) return;
+  if (!r.dev->PICC_ReadCardSerial())   return;
 
-  Serial.print("Karta: ");
-  Serial.print(uid);
-  Serial.println(ok ? "  -> RUXSAT" : "  -> RAD ETILDI");
+  String uid = uidToString(r.dev->uid);
+  bool ok = isAllowed(r.dev->uid);
+  r.dev->PICC_HaltA();
+  r.dev->PCD_StopCrypto1();
+
+  Serial.printf("[%s] Karta: %s  -> %s\n", r.name, uid.c_str(),
+                ok ? "RUXSAT" : "RAD ETILDI");
 
   if (ok) {
-    if (doOpen("KARTA")) queueNotify("\xF0\x9F\x93\xB3 Karta bilan ochildi: " + uid);
+    if (doOpen(r.name))
+      queueNotify("\xF0\x9F\x93\xB3 " + String(r.name) + " o'quvchi - karta bilan ochildi: " + uid);
   } else {
-    queueNotify("\xE2\x9B\x94 Notanish karta: " + uid);
+    queueNotify("\xE2\x9B\x94 " + String(r.name) + " o'quvchi - notanish karta: " + uid);
   }
 
-  // Karta olinmaguncha kutamiz - aks holda sikl takrorlanadi
-  int absent = 0;
-  while (absent < REMOVAL_CHECKS) {
-    absent = cardPresent() ? 0 : absent + 1;
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
+  r.waiting = true;
+  r.absent  = 0;
 }
 
 // ================= YADRO 0: faqat karta va motor =================
 void rfidTask(void *arg) {
-  Serial.println("RFID vazifasi yadro 0 da ishga tushdi");
+  Serial.println("RFID vazifasi yadro 0 da ishga tushdi (2 ta o'quvchi)");
   for (;;) {
-    checkCard();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    for (int i = 0; i < READER_COUNT; i++) serviceReader(readers[i]);
+    vTaskDelay(pdMS_TO_TICKS(RFID_LOOP_MS));
   }
 }
 
@@ -318,6 +398,20 @@ void handleMessages(int count) {
   }
 }
 
+// ================= O'quvchini ishga tushirish =================
+// VersionReg - modul javob berayotganini bilishning eng ishonchli usuli.
+// 0x00 yoki 0xFF => sim ulanmagan, noto'g'ri pin yoki modul kuygan.
+// Ikkita o'quvchi bilan bu tekshiruv ayniqsa kerak: qaysi biri ulanmaganini
+// darrov ko'rsatadi.
+void initReader(ReaderState &r) {
+  r.dev->PCD_Init();
+  delay(50);
+  byte v = r.dev->PCD_ReadRegister(MFRC522::VersionReg);
+  Serial.printf("O'quvchi %-6s VersionReg = 0x%02X  %s\n", r.name, v,
+                (v == 0x00 || v == 0xFF) ? "<-- JAVOB YO'Q! ulanishni tekshiring"
+                                         : "ok");
+}
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
@@ -329,17 +423,18 @@ void setup() {
   pwmSetup();
   motorStop();
 
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SS_PIN);
-  rfid.PCD_Init();
-  delay(50);
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SS1_PIN);
 
-  Serial.println("\n=== Eshik boshqaruvi (RFID + Telegram) ===");
+  Serial.println("\n=== Eshik boshqaruvi (2x RFID + Telegram) ===");
+  for (int i = 0; i < READER_COUNT; i++) initReader(readers[i]);
+
   Serial.printf("Ishga tushishlar: %d\n", bootCount);
   Serial.printf("Reset sababi    : %s\n",
                 esp_reset_reason() == ESP_RST_BROWNOUT
                 ? "BROWNOUT (KUCHLANISH CHOKDI!)" : "normal");
 
-  gateMutex = xSemaphoreCreateMutex();
+  gateMutex   = xSemaphoreCreateMutex();
+  notifyMutex = xSemaphoreCreateMutex();
 
   // Kartani BIRINCHI ishga tushiramiz - WiFi qanday bo'lishidan qat'i nazar ishlaydi
   xTaskCreatePinnedToCore(rfidTask, "rfid", 6144, NULL, 1, NULL, 0);
@@ -350,7 +445,7 @@ void setup() {
   wm.setConfigPortalTimeout(0);          // bloklamagani uchun cheksiz turaversin
   wm.autoConnect(SETUP_AP_NAME, SETUP_AP_PASS);
 
-  Serial.println("Karta hoziroq ishlaydi. Telegram - WiFi ulangach.");
+  Serial.println("Kartalar hoziroq ishlaydi. Telegram - WiFi ulangach.");
   Serial.println("Sozlashni ochish: BOOT tugmasini 2 soniya bosib turing.\n");
 }
 
@@ -391,7 +486,7 @@ void loop() {
   }
   if (botReady && WiFi.status() != WL_CONNECTED) {
     botReady = false;
-    Serial.println("WiFi uzildi - karta ishlashda davom etadi.");
+    Serial.println("WiFi uzildi - kartalar ishlashda davom etadi.");
   }
 
   // WiFi uzoq vaqt yo'q bo'lsa - sozlash portalini qaytadan ochamiz
@@ -414,10 +509,10 @@ void loop() {
   }
 
   if (botReady) {
-    // Yadro 0 dan kelgan xabarni yuboramiz
-    if (pendingNotify && notifyChat.length()) {
-      bot.sendMessage(notifyChat, pendingMsg, "");
-      pendingNotify = false;
+    // Yadro 0 dan kelgan xabarlarni yuboramiz
+    if (notifyChat.length()) {
+      String msg;
+      while (popNotify(msg)) bot.sendMessage(notifyChat, msg, "");
     }
 
     if (millis() - lastPoll > POLL_MS) {
@@ -429,7 +524,7 @@ void loop() {
       lastPoll = millis();
     }
   } else {
-    pendingNotify = false;            // WiFi yo'q - xabarni to'plamaymiz
+    clearNotifyQueue();               // WiFi yo'q - xabarlarni to'plamaymiz
   }
 
   delay(10);
