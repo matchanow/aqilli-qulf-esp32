@@ -14,6 +14,9 @@ va holatni ko'rish mumkin.
 
 - **RFID karta bilan ochish** — faqat ro'yxatdagi kartalar ishlaydi
 - **Ikkita o'quvchi** — tashqi va ichki, bitta SPI shinasida, bir-birini bloklamaydi
+- **Kartalar kodda emas** — ESP32 xotirasida (NVS) saqlanadi, elektr o'chsa ham yo'qolmaydi
+- **Telegramdan karta qo'shish** — `/add Aziz` yuborib kartani tegizasiz, tamom
+- **Serverdan yuklash** — ro'yxat sizning API dan avtomatik tortib olinadi
 - **Telegram boshqaruvi** — `Ochish` / `Yopish` / `Holat` tugmalari
 - **Avtomatik yopilish** — belgilangan vaqtdan keyin
 - **Holat ko'rsatkichi** — ochiqmi yopiqmi, necha soniya qolgani
@@ -121,25 +124,29 @@ Plata: **ESP32 Dev Module**
    const char* BOT_TOKEN = "BU_YERGA_BOTFATHER_TOKENINI_YOZING";
    ```
 
-3. Kartangizning UID sini `tools/rfid_test` bilan aniqlang va ro'yxatga qo'shing:
+3. Kodni platagizga yuklang
 
-   ```cpp
-   const byte ALLOWED[][4] = {
-     { 0x80, 0x96, 0x03, 0x9E },
-   };
-   ```
+   > Standart bo'lim sxemasi bilan sketch **sig'adi**, lekin flash ning 90% ini
+   > egallaydi. Zaxira joy qoldirish uchun **Tools → Partition Scheme →
+   > `Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)`** ni tanlashni tavsiya
+   > qilaman — u holda 60% atrofida qoladi va keyin kod qo'shsangiz sig'maslik
+   > muammosiga duch kelmaysiz.
 
-4. Kodni platagizga yuklang
-5. Telefondan `Eshik-Sozlash` WiFi ga ulaning (parol: `eshik1234`)
-6. Ochilgan sahifada o'z WiFi ingizni tanlab, parolini kiriting
-7. Telegramda botga `/start` yuboring
-8. Javobdagi `chat_id` ni kodga yozing va qayta yuklang:
+   > Kartalarni kodga yozish **shart emas** — ular keyin Telegramdan qo'shiladi.
+   > Pastdagi [Kartalarni boshqarish](#kartalarni-boshqarish) bo'limiga qarang.
+
+4. Telefondan `Eshik-Sozlash` WiFi ga ulaning (parol: `eshik1234`)
+5. Ochilgan sahifada o'z WiFi ingizni tanlab, parolini kiriting
+6. Telegramda botga `/start` yuboring
+7. Javobdagi `chat_id` ni kodga yozing va qayta yuklang:
 
    ```cpp
    String ALLOWED_CHAT_ID = "123456789";
    ```
 
    Bu qadam **muhim** — aks holda botni topgan har kim eshikni ocha oladi.
+
+8. Endi kartalarni qo'shing — [Kartalarni boshqarish](#kartalarni-boshqarish) bo'limiga qarang
 
 ## Telegram buyruqlari
 
@@ -149,8 +156,124 @@ Plata: **ESP32 Dev Module**
 | `/status` | joriy holat |
 | `/open` | ochish |
 | `/close` | yopish |
+| `/cards` | kartalar ro'yxati |
+| `/add <ism>` | yangi karta o'qitish (30 soniya ichida tegizing) |
+| `/addlast <ism>` | oxirgi rad etilgan kartani ro'yxatga qo'shish |
+| `/del <raqam>` | kartani o'chirish (`/cards` dagi raqam bo'yicha) |
+| `/sync` | ro'yxatni serverdan yangilash |
 | `/wifi` | WiFi sozlash oynasini ochish |
 | `/wifireset` | saqlangan WiFi ni o'chirish |
+
+## Kartalarni boshqarish
+
+Kartalar **kodda saqlanmaydi**. Ular ESP32 ning ichki xotirasida (NVS) turadi —
+elektr o'chsa ham, plata qayta yuklansa ham yo'qolmaydi. Yangi karta qo'shish
+uchun kodni qayta yuklash kerak emas.
+
+### Karta qo'shish — usul 1: o'qitish
+
+1. Telegramda `/add Aziz` yuboring
+2. 30 soniya ichida kartani **istalgan** o'quvchiga tegizing
+3. Bot tasdiqlaydi: `✅ Yangi karta qo'shildi: 8096039E (Aziz)`
+
+> O'qitish paytida tegizilgan karta eshikni **ochmaydi** — u faqat ro'yxatga
+> yozib olinadi. 30 soniya ichida tegizmasangiz rejim o'zi bekor bo'ladi.
+
+### Karta qo'shish — usul 2: notanish kartadan
+
+Ro'yxatda yo'q karta tegizilsa, bot uning UID sini yuboradi:
+
+```
+⛔ TASHQI o'quvchi - notanish karta: A1B2C3D4
+
+Qo'shish uchun: /addlast <ism>
+```
+
+`/addlast Dilnoza` yuborsangiz — o'sha karta ro'yxatga qo'shiladi. Kartani
+qaytadan tegizish shart emas.
+
+### O'chirish
+
+`/cards` — raqamlangan ro'yxat chiqadi:
+
+```
+💳 Kartalar (2/40)
+
+1. 8096039E  Aziz
+2. A1B2C3D4  Dilnoza
+
+O'chirish: /del <raqam>
+```
+
+`/del 2` — ikkinchisi o'chadi.
+
+> Ro'yxatga eng ko'pi **40 ta** karta sig'adi (`MAX_CARDS`). Ism 16 belgigacha.
+
+## Serverdan yuklash
+
+Kartalarni o'z serveringizdan boshqarmoqchi bo'lsangiz, `gate_bot.ino` da
+manzilni ko'rsating:
+
+```cpp
+const char* CARDS_URL   = "https://sizning-server.uz/api/cards";
+const char* CARDS_TOKEN = "maxfiy-kalit";     // bo'sh bo'lsa yuborilmaydi
+
+const unsigned long SYNC_INTERVAL_MS = 5UL * 60UL * 1000UL;   // 5 daqiqa, 0 = o'chirilgan
+```
+
+ESP32 quyidagi holatlarda serverga murojaat qiladi:
+
+- WiFi ga ulangan zahoti
+- har `SYNC_INTERVAL_MS` da bir marta
+- Telegramdan `/sync` yuborilganda
+
+`CARDS_TOKEN` bo'sh bo'lmasa, so'rovga `Authorization: Bearer <token>`
+sarlavhasi qo'shiladi.
+
+### Server nima qaytarishi kerak
+
+Oddiy `GET` so'roviga JSON. Ikkala shakl ham qabul qilinadi:
+
+```json
+{
+  "cards": [
+    { "uid": "8096039E", "name": "Aziz" },
+    { "uid": "A1B2C3D4", "name": "Dilnoza" }
+  ]
+}
+```
+
+```json
+[
+  { "uid": "8096039E", "name": "Aziz" }
+]
+```
+
+`uid` — 4 baytli UID ning 8 ta hex belgisi. Ajratgich qo'ysangiz ham bo'ladi
+(`80 96 03 9E`, `80:96:03:9E`) — kod ularni o'zi tozalaydi.
+
+### ⚠ Server yagona haqiqat manbai bo'ladi
+
+Sinxronlash ro'yxatni **to'liq almashtiradi**. Ya'ni `CARDS_URL` to'ldirilgan
+bo'lsa, `/add` bilan qo'shilgan karta keyingi sinxronlashda **o'chib ketadi**.
+
+Shuning uchun ikki xil ishlash tartibidan birini tanlang:
+
+| Tartib | `CARDS_URL` | Karta qayerdan qo'shiladi |
+|---|---|---|
+| Faqat Telegram | bo'sh qoldiring | `/add`, `/addlast` |
+| Server boshqaradi | to'ldiring | serverning o'z bazasidan |
+
+Server tartibida ham `/add` ishlaydi — lekin u **vaqtinchalik**: mehmonni
+darhol kiritish uchun qulay, keyin serverga ham qo'shib qo'ying. Bot `/add`
+javobida buni eslatib turadi.
+
+### HTTPS haqida
+
+Kod `setInsecure()` ishlatadi — ya'ni server sertifikati **tekshirilmaydi**.
+Bu ESP32 da sertifikat zanjirini yangilab turish muammosini chetlab o'tadi,
+lekin o'rtadagi hujumdan himoya qilmaydi. Jiddiy o'rnatmalarda serveringizning
+ildiz sertifikatini kodga qo'yib, `setCACert()` ga o'ting.
 
 ## WiFi ni qayta sozlash
 

@@ -3,14 +3,26 @@
   ---------------------------------------
   Ikki yadroli ishlash:
     Yadro 0 -> RFID (2 ta o'quvchi) + motor   (WiFi dan mustaqil, hech qachon to'xtamaydi)
-    Yadro 1 -> WiFi + Telegram + avtomatik yopilish
+    Yadro 1 -> WiFi + Telegram + server + avtomatik yopilish
 
   Shu sababli karta HAR DOIM ishlaydi:
     - WiFi sozlanmagan bo'lsa ham
     - Sozlash portali ochiq turganda ham
     - Telegram so'rovi ketayotganda ham
 
+  KARTALAR KODDA EMAS
+  -------------------
+  Kartalar ESP32 ning ichki xotirasida (NVS) saqlanadi va elektr o'chsa ham
+  yo'qolmaydi. Yangi karta qo'shish uchun kodni qayta yuklash SHART EMAS:
+    1) Telegramdan /add Aziz  -> 30 soniya ichida kartani tegizing
+    2) yoki serverdan:  /sync -> ro'yxat CARDS_URL dan yuklab olinadi
+
   Kutubxonalar: UniversalTelegramBot 1.3.0, ArduinoJson 6.21.5 (7.x EMAS), WiFiManager 2.0.17
+
+  Bo'lim sxemasi: standart sxema bilan ham sig'adi (flash ning 90% i), lekin
+  zaxira joy qolishi uchun Arduino IDE da
+    Tools -> Partition Scheme -> "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"
+  ni tanlash tavsiya etiladi - u holda 60% ga tushadi.
 
   Ulash
   -----
@@ -33,8 +45,10 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <MFRC522.h>
 #include <esp_system.h>
@@ -48,6 +62,23 @@ const char* BOT_TOKEN = "BU_YERGA_BOTFATHER_TOKENINI_YOZING";
 
 // Bo'sh bo'lsa - botni topgan hamma boshqara oladi. Bot /start da chat_id ni ko'rsatadi.
 String ALLOWED_CHAT_ID = "";
+
+// ---- Server (ixtiyoriy) ----
+// Bo'sh bo'lsa server bilan ishlash butunlay o'chadi va faqat Telegram orqali
+// karta qo'shiladi. To'ldirilsa - ro'yxat shu manzildan yuklanadi.
+// Kutilayotgan javob (ikkala shakl ham qabul qilinadi):
+//   {"cards":[{"uid":"8096039E","name":"Aziz"}]}
+//   [{"uid":"8096039E","name":"Aziz"}]
+const char* CARDS_URL   = "";                 // masalan "https://sizning-server.uz/api/cards"
+const char* CARDS_TOKEN = "";                 // bo'sh bo'lmasa Authorization: Bearer ... yuboriladi
+
+// Avtomatik sinxronlash. 0 = faqat qo'lda (/sync).
+const unsigned long SYNC_INTERVAL_MS = 5UL * 60UL * 1000UL;   // 5 daqiqa
+
+// DIQQAT: sinxronlash ro'yxatni SERVERDAGISI bilan TO'LIQ ALMASHTIRADI.
+// Ya'ni server ishlatilsa - u yagona haqiqat manbai bo'ladi va /add bilan
+// qo'shilgan karta keyingi sinxronlashda o'chib ketadi. Serverdan foydalansangiz,
+// kartani ham serverga qo'shing.
 
 #define BOOT_BTN 0        // BOOT tugmasi - sozlashni majburan ochish uchun
 
@@ -81,14 +112,34 @@ const unsigned long AUTO_CLOSE_MS = 10000;  // ochiq turish vaqti
 const int REMOVAL_CHECKS = 5;
 const int RFID_LOOP_MS   = 50;              // o'quvchilar necha ms da bir tekshiriladi
 
-// ================= Ruxsat berilgan kartalar =================
-// Ro'yxat ikkala o'quvchi uchun umumiy.
-// Ichki/tashqi uchun alohida ro'yxat kerak bo'lsa - shu yerda ikkita massiv
-// qilib, isAllowed() ga o'quvchi indeksini uzating.
-const byte ALLOWED[][4] = {
-  { 0x80, 0x96, 0x03, 0x9E },
+const unsigned long LEARN_WINDOW_MS = 30000;  // /add dan keyin kartani kutish vaqti
+
+// ================= Kartalar ro'yxati =================
+// Kodda emas - NVS da saqlanadi. Nomlar uchun heap ishlatmaymiz (char massiv),
+// chunki ro'yxatga ikkala yadro ham tegadi va String ni yadrolar aro uzatish
+// xotirani buzishi mumkin.
+const int MAX_CARDS = 40;
+const int NAME_LEN  = 17;                   // 16 belgi + NUL
+
+struct Card {
+  byte uid[4];
+  char name[NAME_LEN];
 };
-const int ALLOWED_COUNT = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
+
+Card cards[MAX_CARDS];
+int  cardCount = 0;
+SemaphoreHandle_t cardsMutex;
+Preferences prefs;
+
+// O'qitish rejimi: /add dan keyin tegizilgan karta eshikni ochmaydi, ro'yxatga qo'shiladi.
+volatile bool          learnMode  = false;
+volatile unsigned long learnUntil = 0;
+char learnName[NAME_LEN] = "";
+
+// Oxirgi notanish karta - /addlast uchun. String emas, oddiy baytlar:
+// yadro 0 yozadi, yadro 1 o'qiydi.
+volatile bool lastUnknownValid = false;
+byte lastUnknownUid[4];
 
 // ================= PWM =================
 const int PWM_CH = 0, PWM_FREQ = 1000, PWM_RES = 8;
@@ -136,6 +187,7 @@ volatile int notifyHead = 0, notifyTail = 0;
 bool botReady = false;
 const unsigned long POLL_MS = 1500;
 unsigned long lastPoll = 0;
+unsigned long lastSync = 0;
 
 // WiFi shuncha vaqt yo'q bo'lsa - sozlash portalini qaytadan ochamiz,
 // shunda foydalanuvchi qayta yuklamasdan yangi tarmoq kirita oladi.
@@ -147,7 +199,8 @@ RTC_DATA_ATTR int bootCount = 0;
 const String KEYBOARD =
   "[[{\"text\":\"\xF0\x9F\x94\x93 Ochish\",\"callback_data\":\"/open\"},"
   "{\"text\":\"\xF0\x9F\x94\x92 Yopish\",\"callback_data\":\"/close\"}],"
-  "[{\"text\":\"\xE2\x84\xB9 Holat\",\"callback_data\":\"/status\"}]]";
+  "[{\"text\":\"\xE2\x84\xB9 Holat\",\"callback_data\":\"/status\"},"
+  "{\"text\":\"\xF0\x9F\x92\xB3 Kartalar\",\"callback_data\":\"/cards\"}]]";
 
 // ================= PWM yordamchilari =================
 void pwmSetup() {
@@ -266,29 +319,204 @@ void clearNotifyQueue() {
   xSemaphoreGive(notifyMutex);
 }
 
-// ================= Karta =================
-bool isAllowed(MFRC522::Uid &uid) {
-  if (uid.size != 4) return false;
-  for (int i = 0; i < ALLOWED_COUNT; i++) {
-    bool same = true;
-    for (byte j = 0; j < 4; j++)
-      if (uid.uidByte[j] != ALLOWED[i][j]) { same = false; break; }
-    if (same) return true;
-  }
-  return false;
+// ================= UID yordamchilari =================
+// Ixcham shakl: "8096039E". Serverga ham, /del ga ham shu shakl ishlatiladi.
+String uidToHex(const byte *uid) {
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02X%02X%02X%02X", uid[0], uid[1], uid[2], uid[3]);
+  return String(buf);
 }
 
-String uidToString(MFRC522::Uid &uid) {
-  String s;
-  for (byte i = 0; i < uid.size; i++) {
-    if (uid.uidByte[i] < 0x10) s += "0";
-    s += String(uid.uidByte[i], HEX);
-    if (i + 1 < uid.size) s += " ";
+// "8096039E" yoki "80 96 03 9E" yoki "80:96:03:9E" - hammasi qabul qilinadi.
+bool hexToUid(const String &in, byte *out) {
+  String h;
+  for (unsigned int i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (isHexadecimalDigit(c)) h += c;
   }
-  s.toUpperCase();
+  if (h.length() != 8) return false;
+  for (int i = 0; i < 4; i++)
+    out[i] = (byte) strtoul(h.substring(i * 2, i * 2 + 2).c_str(), NULL, 16);
+  return true;
+}
+
+// ================= Kartalar: xotira =================
+// Barcha funksiyalar mutex ichida ishlaydi.
+
+int findCardLocked(const byte *uid) {
+  for (int i = 0; i < cardCount; i++)
+    if (memcmp(cards[i].uid, uid, 4) == 0) return i;
+  return -1;
+}
+
+// NVS ga yozish. Format: 8096039E:Aziz\n8096039F:Dilnoza\n
+void saveCards() {
+  String blob;
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  for (int i = 0; i < cardCount; i++) {
+    blob += uidToHex(cards[i].uid);
+    blob += ':';
+    blob += cards[i].name;
+    blob += '\n';
+  }
+  xSemaphoreGive(cardsMutex);
+  prefs.putString("cards", blob);
+  Serial.printf("NVS: %d ta karta saqlandi (%u bayt)\n", cardCount, blob.length());
+}
+
+void loadCards() {
+  String blob = prefs.getString("cards", "");
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  cardCount = 0;
+  int start = 0;
+  while (start < (int) blob.length() && cardCount < MAX_CARDS) {
+    int nl = blob.indexOf('\n', start);
+    if (nl < 0) nl = blob.length();
+    String line = blob.substring(start, nl);
+    start = nl + 1;
+
+    int colon = line.indexOf(':');
+    if (colon < 0) continue;
+    byte uid[4];
+    if (!hexToUid(line.substring(0, colon), uid)) continue;
+
+    memcpy(cards[cardCount].uid, uid, 4);
+    strlcpy(cards[cardCount].name, line.substring(colon + 1).c_str(), NAME_LEN);
+    cardCount++;
+  }
+  xSemaphoreGive(cardsMutex);
+  Serial.printf("NVS: %d ta karta yuklandi\n", cardCount);
+}
+
+// Qo'shish. Qaytaradi: 1 = qo'shildi, 0 = allaqachon bor, -1 = joy tugadi
+int addCard(const byte *uid, const char *name) {
+  int r;
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  if (findCardLocked(uid) >= 0)      r = 0;
+  else if (cardCount >= MAX_CARDS)   r = -1;
+  else {
+    memcpy(cards[cardCount].uid, uid, 4);
+    strlcpy(cards[cardCount].name, (name && *name) ? name : "nomsiz", NAME_LEN);
+    cardCount++;
+    r = 1;
+  }
+  xSemaphoreGive(cardsMutex);
+  if (r == 1) saveCards();
+  return r;
+}
+
+bool removeCardAt(int idx, String &removedName, String &removedUid) {
+  bool ok = false;
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  if (idx >= 0 && idx < cardCount) {
+    removedName = cards[idx].name;
+    removedUid  = uidToHex(cards[idx].uid);
+    for (int i = idx; i < cardCount - 1; i++) cards[i] = cards[i + 1];
+    cardCount--;
+    ok = true;
+  }
+  xSemaphoreGive(cardsMutex);
+  if (ok) saveCards();
+  return ok;
+}
+
+// Yadro 0 dan chaqiriladi - qisqa va bloklamaydigan bo'lishi kerak.
+bool isAllowed(MFRC522::Uid &uid) {
+  if (uid.size != 4) return false;
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  bool ok = findCardLocked(uid.uidByte) >= 0;
+  xSemaphoreGive(cardsMutex);
+  return ok;
+}
+
+String cardListText() {
+  String s = "\xF0\x9F\x92\xB3 Kartalar (" + String(cardCount) + "/" + String(MAX_CARDS) + ")\n\n";
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  if (cardCount == 0) {
+    s += "Ro'yxat bo'sh.\n/add <ism> yuborib karta qo'shing.";
+  } else {
+    for (int i = 0; i < cardCount; i++) {
+      s += String(i + 1) + ". " + uidToHex(cards[i].uid) + "  " + cards[i].name + "\n";
+    }
+    s += "\nO'chirish: /del <raqam>";
+  }
+  xSemaphoreGive(cardsMutex);
   return s;
 }
 
+// ================= Serverdan sinxronlash =================
+// Yadro 1 dan chaqiriladi (tarmoq shu yerda).
+bool syncFromServer(String &report) {
+  if (!strlen(CARDS_URL))            { report = "CARDS_URL sozlanmagan.";        return false; }
+  if (WiFi.status() != WL_CONNECTED) { report = "WiFi yo'q - sinxronlab bo'lmadi."; return false; }
+
+  HTTPClient http;
+  WiFiClientSecure *sec = nullptr;
+  bool started;
+
+  if (String(CARDS_URL).startsWith("https://")) {
+    sec = new WiFiClientSecure;
+    if (!sec) { report = "Xotira yetmadi."; return false; }
+    sec->setInsecure();                 // sertifikat tekshirilmaydi
+    started = http.begin(*sec, CARDS_URL);
+  } else {
+    started = http.begin(CARDS_URL);
+  }
+
+  if (!started) {
+    if (sec) delete sec;
+    report = "Manzil noto'g'ri: " + String(CARDS_URL);
+    return false;
+  }
+
+  http.setTimeout(10000);
+  if (strlen(CARDS_TOKEN)) http.addHeader("Authorization", String("Bearer ") + CARDS_TOKEN);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    report = "Server javobi: " + String(code);
+    http.end();
+    if (sec) delete sec;
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+  if (sec) delete sec;
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) { report = "JSON xato: " + String(err.c_str()); return false; }
+
+  // {"cards":[...]} va [...] - ikkalasi ham qabul qilinadi
+  JsonArray arr = doc["cards"].is<JsonArray>() ? doc["cards"].as<JsonArray>()
+                                               : doc.as<JsonArray>();
+  if (arr.isNull()) { report = "JSON ichida ro'yxat topilmadi."; return false; }
+
+  // Ro'yxat TO'LIQ almashtiriladi - server yagona haqiqat manbai.
+  int added = 0, skipped = 0;
+  xSemaphoreTake(cardsMutex, portMAX_DELAY);
+  cardCount = 0;
+  for (JsonObject o : arr) {
+    if (cardCount >= MAX_CARDS) { skipped++; continue; }
+    const char* u = o["uid"] | "";
+    byte uid[4];
+    if (!hexToUid(String(u), uid)) { skipped++; continue; }
+    memcpy(cards[cardCount].uid, uid, 4);
+    strlcpy(cards[cardCount].name, o["name"] | "nomsiz", NAME_LEN);
+    cardCount++;
+    added++;
+  }
+  xSemaphoreGive(cardsMutex);
+  saveCards();
+
+  report = "\xE2\x9C\x85 Serverdan yuklandi: " + String(added) + " ta karta";
+  if (skipped) report += "\n\xE2\x9A\xA0 " + String(skipped) + " tasi o'tkazib yuborildi (noto'g'ri UID yoki joy tugadi)";
+  Serial.println(report);
+  return true;
+}
+
+// ================= Karta =================
 // HALT holatidagi kartani REQA ko'rmaydi, WUPA esa ko'radi
 bool cardPresent(MFRC522 &dev) {
   byte atqa[2];
@@ -317,23 +545,54 @@ void serviceReader(ReaderState &r) {
   if (!r.dev->PICC_IsNewCardPresent()) return;
   if (!r.dev->PICC_ReadCardSerial())   return;
 
-  String uid = uidToString(r.dev->uid);
-  bool ok = isAllowed(r.dev->uid);
+  byte uid[4] = {0};
+  int  n = (r.dev->uid.size < 4) ? r.dev->uid.size : 4;
+  memcpy(uid, r.dev->uid.uidByte, n);
+  bool sized4 = (r.dev->uid.size == 4);
+  String hex  = uidToHex(uid);
+
   r.dev->PICC_HaltA();
   r.dev->PCD_StopCrypto1();
+  r.waiting = true;
+  r.absent  = 0;
 
-  Serial.printf("[%s] Karta: %s  -> %s\n", r.name, uid.c_str(),
+  // ---- O'qitish rejimi: eshikni OCHMAYMIZ, ro'yxatga qo'shamiz ----
+  if (learnMode) {
+    if (millis() > learnUntil) {
+      learnMode = false;                     // vaqt tugagan
+    } else if (!sized4) {
+      queueNotify("\xE2\x9A\xA0 Bu karta 4 baytli UID bermadi, qo'shilmadi.");
+      return;
+    } else {
+      int res = addCard(uid, learnName);
+      learnMode = false;
+      Serial.printf("[%s] O'QITISH: %s -> %d\n", r.name, hex.c_str(), res);
+      if (res == 1)
+        queueNotify("\xE2\x9C\x85 Yangi karta qo'shildi: " + hex + "  (" + String(learnName) + ")");
+      else if (res == 0)
+        queueNotify("\xE2\x84\xB9 Bu karta allaqachon ro'yxatda: " + hex);
+      else
+        queueNotify("\xE2\x9B\x94 Joy tugadi (" + String(MAX_CARDS) + " ta karta).");
+      return;
+    }
+  }
+
+  // ---- Oddiy rejim ----
+  bool ok = sized4 && isAllowed(r.dev->uid);
+  Serial.printf("[%s] Karta: %s  -> %s\n", r.name, hex.c_str(),
                 ok ? "RUXSAT" : "RAD ETILDI");
 
   if (ok) {
     if (doOpen(r.name))
-      queueNotify("\xF0\x9F\x93\xB3 " + String(r.name) + " o'quvchi - karta bilan ochildi: " + uid);
+      queueNotify("\xF0\x9F\x93\xB3 " + String(r.name) + " o'quvchi - karta bilan ochildi: " + hex);
   } else {
-    queueNotify("\xE2\x9B\x94 " + String(r.name) + " o'quvchi - notanish karta: " + uid);
+    if (sized4) {
+      memcpy(lastUnknownUid, uid, 4);
+      lastUnknownValid = true;
+    }
+    queueNotify("\xE2\x9B\x94 " + String(r.name) + " o'quvchi - notanish karta: " + hex +
+                "\n\nQo'shish uchun: /addlast <ism>");
   }
-
-  r.waiting = true;
-  r.absent  = 0;
 }
 
 // ================= YADRO 0: faqat karta va motor =================
@@ -361,15 +620,83 @@ void handleMessages(int count) {
 
     notifyChat = chat_id;
 
-    if (text == "/open") {
+    // Buyruq va argumentni ajratamiz: "/add Aziz" -> cmd="/add", arg="Aziz"
+    String cmd = text, arg = "";
+    int sp = text.indexOf(' ');
+    if (sp > 0) {
+      cmd = text.substring(0, sp);
+      arg = text.substring(sp + 1);
+      arg.trim();
+    }
+
+    if (cmd == "/open") {
       String m = doOpen("TELEGRAM") ? "\xF0\x9F\x94\x93 Ochildi\n\n" : "Eshik allaqachon ochiq\n\n";
       bot.sendMessageWithInlineKeyboard(chat_id, m + statusText(), "", KEYBOARD);
     }
-    else if (text == "/close") {
+    else if (cmd == "/close") {
       String m = doClose("TELEGRAM") ? "\xF0\x9F\x94\x92 Yopildi\n\n" : "Eshik allaqachon yopiq\n\n";
       bot.sendMessageWithInlineKeyboard(chat_id, m + statusText(), "", KEYBOARD);
     }
-    else if (text == "/wifi") {
+    // ---- Kartalar ----
+    else if (cmd == "/cards") {
+      bot.sendMessageWithInlineKeyboard(chat_id, cardListText(), "", KEYBOARD);
+    }
+    else if (cmd == "/add") {
+      if (!arg.length()) {
+        bot.sendMessage(chat_id, "Ism kerak. Masalan: /add Aziz", "");
+      } else {
+        strlcpy(learnName, arg.c_str(), NAME_LEN);
+        learnUntil = millis() + LEARN_WINDOW_MS;
+        learnMode  = true;                    // OXIRIDA - yadro 0 tayyor qiymatlarni ko'rsin
+        String m = "\xF0\x9F\x93\xB3 Kartani istalgan o'quvchiga tegizing.\n";
+        m += "Ism: " + String(learnName) + "\n";
+        m += String(LEARN_WINDOW_MS / 1000) + " soniya vaqtingiz bor.\n\n";
+        m += "\xE2\x84\xB9 Shu payt tegizilgan karta eshikni OCHMAYDI.";
+        if (strlen(CARDS_URL))
+          m += "\n\n\xE2\x9A\xA0 Server yoqilgan: bu karta keyingi sinxronlashda o'chib ketadi. "
+               "Uni serverga ham qo'shing.";
+        bot.sendMessage(chat_id, m, "");
+      }
+    }
+    else if (cmd == "/addlast") {
+      if (!lastUnknownValid) {
+        bot.sendMessage(chat_id, "Oxirgi notanish karta yo'q. Avval kartani o'quvchiga tegizing.", "");
+      } else {
+        byte uid[4];
+        memcpy(uid, lastUnknownUid, 4);
+        int res = addCard(uid, arg.length() ? arg.c_str() : "nomsiz");
+        if (res == 1) {
+          lastUnknownValid = false;
+          bot.sendMessage(chat_id, "\xE2\x9C\x85 Qo'shildi: " + uidToHex(uid) +
+                                   "  (" + (arg.length() ? arg : "nomsiz") + ")", "");
+        } else if (res == 0) {
+          bot.sendMessage(chat_id, "\xE2\x84\xB9 Bu karta allaqachon ro'yxatda.", "");
+        } else {
+          bot.sendMessage(chat_id, "\xE2\x9B\x94 Joy tugadi (" + String(MAX_CARDS) + " ta).", "");
+        }
+      }
+    }
+    else if (cmd == "/del") {
+      int idx = arg.toInt() - 1;              // ro'yxatdagi raqam 1 dan boshlanadi
+      String nm, ux;
+      if (!arg.length() || idx < 0) {
+        bot.sendMessage(chat_id, "Raqam kerak. /cards ni ochib raqamini ko'ring.\nMasalan: /del 2", "");
+      } else if (removeCardAt(idx, nm, ux)) {
+        bot.sendMessageWithInlineKeyboard(chat_id,
+          "\xF0\x9F\x97\x91 O'chirildi: " + ux + "  (" + nm + ")\n\n" + cardListText(), "", KEYBOARD);
+      } else {
+        bot.sendMessage(chat_id, "Bunday raqam yo'q.", "");
+      }
+    }
+    else if (cmd == "/sync") {
+      bot.sendMessage(chat_id, "\xE2\x8F\xB3 Serverdan yuklanmoqda...", "");
+      String report;
+      syncFromServer(report);
+      lastSync = millis();
+      bot.sendMessageWithInlineKeyboard(chat_id, report + "\n\n" + cardListText(), "", KEYBOARD);
+    }
+    // ---- WiFi ----
+    else if (cmd == "/wifi") {
       // Saqlangan parolni o'chirmaydi - shunchaki sozlash oynasini ochadi
       bot.sendMessage(chat_id,
         "\xF0\x9F\x93\xB6 Sozlash oynasi ochildi.\n\n"
@@ -380,17 +707,21 @@ void handleMessages(int count) {
       delay(500);
       wm.startConfigPortal(SETUP_AP_NAME, SETUP_AP_PASS);
     }
-    else if (text == "/wifireset") {
-      bot.sendMessage(chat_id, "WiFi sozlamalari o'chirildi. Plata qayta yuklanmoqda.", "");
+    else if (cmd == "/wifireset") {
+      bot.sendMessage(chat_id, "WiFi sozlamalari o'chirildi. Plata qayta yuklanmoqda.\n"
+                               "\xE2\x84\xB9 Kartalar ro'yxati saqlanib qoladi.", "");
       wm.resetSettings();
       delay(1500);
       ESP.restart();
     }
-    else if (text == "/status" || text == "/start") {
+    else if (cmd == "/status" || cmd == "/start") {
       String head = "\xF0\x9F\x9A\xAA Eshik boshqaruvi\n\n";
       if (!ALLOWED_CHAT_ID.length())
         head += "\xE2\x9A\xA0 Himoya yoqilmagan!\nchat_id: " + chat_id + "\n\n";
-      bot.sendMessageWithInlineKeyboard(chat_id, head + statusText(), "", KEYBOARD);
+      String tail = "\n\n\xF0\x9F\x92\xB3 Kartalar: " + String(cardCount) + " ta";
+      if (cmd == "/start")
+        tail += "\n\nKarta qo'shish: /add <ism>\nRo'yxat: /cards";
+      bot.sendMessageWithInlineKeyboard(chat_id, head + statusText() + tail, "", KEYBOARD);
     }
     else {
       bot.sendMessageWithInlineKeyboard(chat_id, statusText(), "", KEYBOARD);
@@ -435,6 +766,12 @@ void setup() {
 
   gateMutex   = xSemaphoreCreateMutex();
   notifyMutex = xSemaphoreCreateMutex();
+  cardsMutex  = xSemaphoreCreateMutex();
+
+  // Kartalarni RFID vazifasidan OLDIN yuklaymiz, aks holda birinchi soniyalarda
+  // ro'yxat bo'sh bo'lib, haqiqiy karta rad etilardi.
+  prefs.begin("qulf", false);
+  loadCards();
 
   // Kartani BIRINCHI ishga tushiramiz - WiFi qanday bo'lishidan qat'i nazar ishlaydi
   xTaskCreatePinnedToCore(rfidTask, "rfid", 6144, NULL, 1, NULL, 0);
@@ -476,6 +813,12 @@ void loop() {
   checkSetupButton();
   wm.process();                       // sozlash portalini yuritadi
 
+  // O'qitish rejimi vaqti tugadimi?
+  if (learnMode && millis() > learnUntil) {
+    learnMode = false;
+    queueNotify("\xE2\x8F\xB1 Vaqt tugadi - karta tegizilmadi. /add bilan qaytadan urinib ko'ring.");
+  }
+
   // WiFi endigina ulandimi?
   if (!botReady && WiFi.status() == WL_CONNECTED) {
     secured.setInsecure();
@@ -483,6 +826,13 @@ void loop() {
     botReady = true;
     Serial.println("WiFi: " + WiFi.SSID() + "   IP: " + WiFi.localIP().toString());
     Serial.println("Bot tayyor. Telegramda /start yuboring.");
+
+    // Ulanishi bilan ro'yxatni serverdan olamiz
+    if (strlen(CARDS_URL)) {
+      String report;
+      syncFromServer(report);
+      lastSync = millis();
+    }
   }
   if (botReady && WiFi.status() != WL_CONNECTED) {
     botReady = false;
@@ -513,6 +863,13 @@ void loop() {
     if (notifyChat.length()) {
       String msg;
       while (popNotify(msg)) bot.sendMessage(notifyChat, msg, "");
+    }
+
+    // Davriy sinxronlash
+    if (strlen(CARDS_URL) && SYNC_INTERVAL_MS && millis() - lastSync > SYNC_INTERVAL_MS) {
+      String report;
+      syncFromServer(report);
+      lastSync = millis();
     }
 
     if (millis() - lastPoll > POLL_MS) {
